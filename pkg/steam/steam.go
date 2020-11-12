@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"errors"
 	"fmt"
+	"github.com/otiai10/copy"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -15,7 +17,7 @@ import (
 )
 
 const (
-	tmpSteamLocation   = "./steam/"
+	tmpSteamLocation   = "./steam"
 	windowsSteamCMDURL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 	windowsZipFileName = "steamcmd.zip"
 	linuxSteamCMDURL   = "http://media.steampowered.com/installer/steamcmd_linux.tar.gz"
@@ -28,25 +30,60 @@ const (
 
 type SteamHandler struct {
 	CMDLocation string
+	workDir     string
 }
 
-func NewSteamHandler() (*SteamHandler, error) {
-	// TODO: check path for binary, check PATH for system availability
-	if err := os.MkdirAll(tmpSteamLocation, 0755); err != nil {
+func NewSteamHandler(workDir string) (*SteamHandler, error) {
+	currPath, err := os.Getwd()
+	if err != nil {
 		return nil, err
 	}
-	return &SteamHandler{}, nil
+	if err := os.MkdirAll(filepath.Join(currPath, workDir), 0755); err != nil {
+		return nil, err
+	}
+	return &SteamHandler{
+		workDir: workDir,
+	}, nil
 }
 
-func (s *SteamHandler) DownloadMod(modID string) error {
+func (s *SteamHandler) DownloadMod(modID string) (string, error) {
 	if err := s.setSteamCMDPath(); err != nil {
-		return err
+		return "", err
 	}
-	c := exec.Command(s.CMDLocation, "+login", "anonymous", "+workshop_download_item", arkGameID, modID,
-		"+force_install_dir", tmpSteamLocation, "+quit")
+	tmpDir := filepath.Join(os.TempDir(), "amm")
+	c := exec.Command(s.CMDLocation, "+login", "anonymous", "+force_install_dir", tmpDir, "+workshop_download_item", arkGameID, modID, "+quit")
 	c.Stderr = os.Stderr
 	c.Stdout = os.Stdout
-	return c.Run()
+	if err := c.Run(); err != nil {
+		return "", err
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			fmt.Printf("could not cleanup tmp directory %v\n", err)
+		}
+
+	}()
+	if err := os.MkdirAll(s.workDir, 0755); err != nil {
+		return "", err
+	}
+	finalModLocation, err := s.copyMod(tmpDir, modID)
+	if err != nil {
+		return "", err
+	}
+	return finalModLocation, nil
+}
+
+func (s *SteamHandler) copyMod(srcLocation, modID string) (string, error) {
+	srcModLocation := filepath.Join(srcLocation, "/steamapps/workshop/content", arkGameID, modID)
+	dstLocation := filepath.Join(s.workDir, modID)
+	_, err := os.Stat(dstLocation)
+	if os.IsExist(err) {
+		return "", errors.New("destination mod location already exists")
+	}
+	if err := copy.Copy(srcModLocation, dstLocation); err != nil {
+		return "", err
+	}
+	return dstLocation, nil
 }
 
 func (s *SteamHandler) setSteamCMDPath() error {
@@ -59,7 +96,6 @@ func (s *SteamHandler) setSteamCMDPath() error {
 }
 
 func (s *SteamHandler) DownloadCMD() error {
-	fmt.Println("OS: ", runtime.GOOS)
 	switch runtime.GOOS {
 	case "windows":
 		resp, err := http.Get(windowsSteamCMDURL)
