@@ -17,13 +17,14 @@ import (
 	"strings"
 )
 
-type ModsUnpacker struct {
+type ModUnpacker struct {
+	modID               int32
 	currentPath         string
 	rawModsDirName      string
 	unpackedWorkDirName string
 }
 
-func NewModsUnpacker(rawModPath, unpackModDirectory string) (*ModsUnpacker, error) {
+func NewModsUnpacker(rawModPath, unpackModDirectory string) (*ModUnpacker, error) {
 	currPath, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -31,17 +32,22 @@ func NewModsUnpacker(rawModPath, unpackModDirectory string) (*ModsUnpacker, erro
 	if !filepath.IsAbs(unpackModDirectory) {
 		unpackModDirectory = filepath.Join(currPath, unpackModDirectory)
 	}
+	modID, err := strconv.ParseInt(filepath.Base(rawModPath), 10, 32)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(unpackModDirectory, 0755); err != nil {
 		return nil, err
 	}
-	return &ModsUnpacker{
+	return &ModUnpacker{
+		modID:               int32(modID),
 		currentPath:         currPath,
 		rawModsDirName:      rawModPath,
 		unpackedWorkDirName: unpackModDirectory,
 	}, nil
 }
 
-func (m *ModsUnpacker) Unpack() error {
+func (m *ModUnpacker) Unpack() error {
 	archivedFilesPathsSizes, err := m.getArchivedFilesPathsSizes(m.rawModsDirName)
 	if err != nil {
 		return err
@@ -75,7 +81,7 @@ type archiveFile struct {
 	Size    int
 }
 
-func (m *ModsUnpacker) getArchivedFilesPathsSizes(dir string) ([]*archiveFile, error) {
+func (m *ModUnpacker) getArchivedFilesPathsSizes(dir string) ([]*archiveFile, error) {
 	stat, err := os.Stat(dir)
 	if err != nil {
 		return nil, err
@@ -138,22 +144,22 @@ func (m *ModsUnpacker) getArchivedFilesPathsSizes(dir string) ([]*archiveFile, e
             - 20 (8 bytes) first chunk packed/compressedSize size
             - 26 (8 bytes) first chunk unpacked/uncompressedSize size
             - 20 and 26 repeat until the total of all the unpacked/uncompressedSize chunk sizes matches the unpacked/uncompressedSize full size.
-Read all the archive data and verify integrity (there should only be one partial chunk, and each chunk should match the archives header).
+Read all the archive mapNames and verify integrity (there should only be one partial chunk, and each chunk should match the archives header).
 https://github.com/barrycarey/Ark_Mod_Downloader/blob/master/arkit.py
 */
 
-func (m *ModsUnpacker) getFileReader(path string) (io.ReadCloser, error) {
+func (m *ModUnpacker) getFileReader(path string) (io.ReadCloser, error) {
 	return os.Open(path)
 }
 
-func (m *ModsUnpacker) writeFile(data []byte, location string) error {
+func (m *ModUnpacker) writeFile(data []byte, location string) error {
 	if err := m.ensureDir(location); err != nil {
 		return err
 	}
 	return ioutil.WriteFile(location, data, 0644)
 }
 
-func (m *ModsUnpacker) ensureDir(fileName string) error {
+func (m *ModUnpacker) ensureDir(fileName string) error {
 	dirName := filepath.Dir(fileName)
 	if _, serr := os.Stat(dirName); serr != nil {
 		merr := os.MkdirAll(dirName, os.ModePerm)
@@ -164,13 +170,12 @@ func (m *ModsUnpacker) ensureDir(fileName string) error {
 	return nil
 }
 
-func (m *ModsUnpacker) unpackArchive(reader io.ReadCloser) ([]byte, error) {
+func (m *ModUnpacker) unpackArchive(reader io.ReadCloser) ([]byte, error) {
 	defer reader.Close()
 	header, err := m.unpackArchiveHeader(reader)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("header: %+v\n", header)
 	chunksMetadata, err := m.unpackChunksMetadata(reader, header)
 	if err != nil {
 		return nil, err
@@ -189,7 +194,7 @@ type archiveHeader struct {
 	unpackedSize      int64 // unpacked/uncompressedSize full size
 }
 
-func (m *ModsUnpacker) unpackArchiveHeader(reader io.ReadCloser) (*archiveHeader, error) {
+func (m *ModUnpacker) unpackArchiveHeader(reader io.ReadCloser) (*archiveHeader, error) {
 	archiveHeader := new(archiveHeader)
 	err := binary.Read(reader, binary.LittleEndian, &archiveHeader.signature)
 	if err != nil {
@@ -228,7 +233,7 @@ type chunksMetadata struct {
 	uncompressedSize int64 // chunk unpacked/uncompressedSize size
 }
 
-func (m *ModsUnpacker) unpackChunksMetadata(reader io.ReadCloser, header *archiveHeader) ([]*chunksMetadata, error) {
+func (m *ModUnpacker) unpackChunksMetadata(reader io.ReadCloser, header *archiveHeader) ([]*chunksMetadata, error) {
 	var chunks []*chunksMetadata
 	var sizeIndex int64 = 0
 	var rawCompressed, rawUncompressed [8]byte
@@ -258,7 +263,7 @@ func (m *ModsUnpacker) unpackChunksMetadata(reader io.ReadCloser, header *archiv
 	return chunks, nil
 }
 
-func (m *ModsUnpacker) unpackChunks(chunksMetadata []*chunksMetadata, reader io.ReadCloser) ([]byte, error) {
+func (m *ModUnpacker) unpackChunks(chunksMetadata []*chunksMetadata, reader io.ReadCloser) ([]byte, error) {
 	var readChunks = 0
 	var data []byte
 	for _, chunk := range chunksMetadata {
@@ -301,14 +306,19 @@ How To Parse modmeta.info:
             5. Read ahead by the number of bytes retrieved from step 4
             6. Start at step 2 again
 */
-func (m *ModsUnpacker) unMarshalModMetaInfo(fileData []byte) (map[string]string, error) {
+
+type modMetaInfo struct {
+	key   string
+	value string
+}
+
+func (m *ModUnpacker) unpackModMetaInfo(reader io.ReadCloser) ([]modMetaInfo, error) {
+	defer reader.Close()
 	var totalPairs int32
-	pairs := make(map[string]string)
-	reader := bytes.NewReader(fileData)
+	pairs := []modMetaInfo{}
 	if err := binary.Read(reader, binary.LittleEndian, &totalPairs); err != nil {
 		return nil, err
 	}
-	fmt.Printf("totalPairs: %d\n", totalPairs)
 	for i := 0; i < int(totalPairs); i++ {
 		var keySize int32
 		var valueSize int32
@@ -331,50 +341,121 @@ func (m *ModsUnpacker) unMarshalModMetaInfo(fileData []byte) (map[string]string,
 		if err != nil {
 			return nil, err
 		}
-		pairs[string(d)] = string(p)
-		fmt.Printf("keySize: %d\n", keySize)
-		fmt.Printf("key: %s\n", string(d))
-		fmt.Printf("valueSize: %d\n", valueSize)
-		fmt.Printf("value: %s\n", string(p))
-
+		pairs = append(pairs, modMetaInfo{
+			key:   string(d),
+			value: string(p),
+		})
 	}
-
 	return pairs, nil
 }
 
-func (m *ModsUnpacker) unMarshalModInfo(fileData []byte) ([]string, error) {
+func (m *ModUnpacker) unpackModInfo(reader io.ReadCloser) ([]ue4String, error) {
+	defer reader.Close()
 	var totalPairs int32
-	var pairs []string
-	reader := bytes.NewReader(fileData)
-	var s int32
-	err := binary.Read(reader, binary.LittleEndian, &s)
-	if err != nil {
+	var pairs []ue4String
+
+	header := ue4String{}
+	if err := header.read(reader); err != nil {
 		return nil, err
 	}
-	fmt.Println("s:", s)
-	d := make([]byte, s)
-	err = binary.Read(reader, binary.LittleEndian, &d)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Println("d:", string(d))
 
 	if err := binary.Read(reader, binary.LittleEndian, &totalPairs); err != nil {
 		return nil, err
 	}
 	fmt.Printf("totalPairs: %d\n", totalPairs)
 	for i := 0; i < int(totalPairs); i++ {
-		var keySize int32
-		err := binary.Read(reader, binary.LittleEndian, &keySize)
-		if err != nil {
+		pair := ue4String{}
+		if err := pair.read(reader); err != nil {
 			return nil, err
 		}
-		d := make([]byte, keySize)
-		err = binary.Read(reader, binary.LittleEndian, &d)
-		if err != nil {
-			return nil, err
-		}
-		pairs = append(pairs, string(d))
+		pairs = append(pairs, pair)
 	}
 	return pairs, nil
+}
+
+func (m *ModUnpacker) createModFileData(mInfo []ue4String, mMInfo []modMetaInfo) []byte {
+	buff := bytes.Buffer{}
+
+	// modID with 4 padding bytes
+	binary.Write(&buff, binary.LittleEndian, uint32(m.modID))
+	binary.Write(&buff, binary.LittleEndian, []byte{0, 0, 0, 0})
+
+	binary.Write(&buff, binary.LittleEndian, newUE4String("ModName").Bytes())
+
+	binary.Write(&buff, binary.LittleEndian, newUE4String("").Bytes())
+
+	binary.Write(&buff, binary.LittleEndian, uint32(len(mInfo)))
+
+	for _, v := range mInfo {
+		binary.Write(&buff, binary.LittleEndian, newUE4String(v.text).Bytes())
+	}
+	// some static needed data
+	binary.Write(&buff, binary.LittleEndian, 4280483635)
+	// some static needed data again
+	binary.Write(&buff, binary.LittleEndian, 2)
+
+	modType := []byte{0}
+
+	for _, m := range mMInfo {
+		if m.key == "ModType" {
+			fmt.Printf("found ModType")
+			modType = []byte{1}
+		}
+	}
+	// can be tricky to be validated
+	binary.Write(&buff, binary.LittleEndian, modType)
+	binary.Write(&buff, binary.LittleEndian, 2)
+	binary.Write(&buff, binary.LittleEndian, len(mMInfo))
+	for _, d := range mMInfo {
+		binary.Write(&buff, binary.LittleEndian, newUE4String(d.key).Bytes())
+		binary.Write(&buff, binary.LittleEndian, newUE4String(d.value).Bytes())
+	}
+
+	return buff.Bytes()
+}
+
+type ue4String struct {
+	size int32
+	text string
+}
+
+func newUE4String(text string) *ue4String {
+	return &ue4String{
+		size: int32(len(text)),
+		text: text,
+	}
+}
+
+func (u *ue4String) Bytes() []byte {
+	buff := bytes.Buffer{}
+	// need to add 1 since last 0 byte
+	binary.Write(&buff, binary.LittleEndian, u.size+1)
+
+	binary.Write(&buff, binary.LittleEndian, []byte(u.text))
+
+	// need 0 value at the end
+	binary.Write(&buff, binary.LittleEndian, []byte{0})
+
+	return buff.Bytes()
+}
+
+func (u *ue4String) read(reader io.ReadCloser) error {
+	var s int32
+	err := binary.Read(reader, binary.LittleEndian, &s)
+	if err != nil {
+		return err
+	}
+	// the string is a flag
+	if s < 0 {
+		fmt.Printf("flag\n")
+		return nil
+	}
+	u.size = s
+	d := make([]byte, s)
+	err = binary.Read(reader, binary.LittleEndian, &d)
+	if err != nil {
+		return err
+	}
+	u.text = string(d[:len(d)-1])
+	return nil
 }
